@@ -29,7 +29,30 @@ const HISTORY_PAGE_SIZE: number = 30;
 const DEFAULT_MID_SEQ_UNKNOWN: number = 0;
 const CONTENT_TYPE_TEXT: number = 1;
 
+export class SentTextMessageReceipt {
+  msgId: string = '';
+  chatId: string = '';
+  chatType: number = 0;
+  text: string = '';
+  contentType: number = CONTENT_TYPE_TEXT;
+  sendTime: number = 0;
+}
+
 export class MessageService {
+  private buildUiKey(source: Msg): string {
+    const msgId: string = source.msgId ?? '';
+    if (msgId.length > 0) {
+      return msgId;
+    }
+    const msgSeq: number = source.msgSeq ?? 0;
+    const sendTime: number = source.sendTime ?? 0;
+    const senderId: string = source.sender?.chatId ?? '';
+    const direction: string = source.direction ?? '';
+    const contentType: number = source.contentType ?? 0;
+    const text: string = source.content?.text ?? source.content?.tip ?? '';
+    return `${msgSeq}_${sendTime}_${senderId}_${direction}_${contentType}_${text.length}`;
+  }
+
   private randomHex(length: number): string {
     const chars: string = '0123456789abcdef';
     let result: string = '';
@@ -80,6 +103,7 @@ export class MessageService {
 
   private toMessageItem(source: Msg): MessageItem {
     const target: MessageItem = new MessageItem();
+    target.uiKey = this.buildUiKey(source);
     target.msgId = source.msgId ?? '';
     target.chatId = source.sender?.chatId ?? '';
     target.senderId = source.sender?.chatId ?? '';
@@ -174,7 +198,7 @@ export class MessageService {
     return await this.listMessageByMidSeq(chatId, chatType, msgId, UINT64_MAX_SENTINEL, msgCount, DEFAULT_MID_SEQ_UNKNOWN);
   }
 
-  async sendTextMessage(chatId: string, chatType: number, text: string): Promise<void> {
+  async sendTextMessage(chatId: string, chatType: number, text: string): Promise<SentTextMessageReceipt> {
     const trimmedText: string = text.trim();
     if (chatId.length === 0) {
       throw new Error('chat id is empty');
@@ -198,5 +222,14 @@ export class MessageService {
     const binaryResponse: Uint8Array = await ApiClient.postProtoWithBody('/v1/msg/send-message', bodyBuffer);
     const decoded: SendMessage = decodeSendMessage(binaryResponse);
     this.ensureSuccess(decoded.status, 'send message failed');
+
+    const receipt: SentTextMessageReceipt = new SentTextMessageReceipt();
+    receipt.msgId = requestBody.msgId ?? '';
+    receipt.chatId = chatId;
+    receipt.chatType = chatType;
+    receipt.text = trimmedText;
+    receipt.contentType = CONTENT_TYPE_TEXT;
+    receipt.sendTime = Date.now();
+    return receipt;
   }
 }

@@ -4,14 +4,18 @@ import {
   WebSocketConnectionListener,
   WebSocketConnectionState,
   WebSocketEvent,
-  WebSocketEventListener
+  WebSocketEventListener,
+  WebSocketLogEntry,
+  WebSocketLogListener
 } from '../models/WebSocketModels';
 import { MessageItem } from '../models/ChatModels';
+import { WebSocketLogService } from './WebSocketLogService';
 
 export class WebSocketManager {
   private static instance: WebSocketManager | undefined = undefined;
   private readonly userService: UserService = new UserService();
   private readonly webSocketService: WebSocketService = new WebSocketService();
+  private readonly logService: WebSocketLogService = WebSocketLogService.getInstance();
   private started: boolean = false;
   private currentUserId: string = '';
 
@@ -27,19 +31,25 @@ export class WebSocketManager {
 
   async start(): Promise<void> {
     if (this.started) {
+      this.logService.info('manager/start', 'skip start because manager already started');
       return;
     }
+    this.logService.info('manager/start', 'start requested');
     const profile = await this.userService.getMyUserInfo();
     const userId: string = profile.id;
     if (userId.length === 0) {
+      this.logService.error('manager/start', 'current user id is empty');
       throw new Error('current user id is empty');
     }
     this.currentUserId = userId;
+    this.logService.info('manager/start', `resolved currentUserId=${userId}`);
     await this.webSocketService.connect(userId);
     this.started = true;
+    this.logService.info('manager/start', 'manager marked as started');
   }
 
   async stop(): Promise<void> {
+    this.logService.info('manager/stop', 'stop requested');
     this.started = false;
     this.currentUserId = '';
     await this.webSocketService.disconnect();
@@ -78,5 +88,21 @@ export class WebSocketManager {
 
   isStarted(): boolean {
     return this.started;
+  }
+
+  addLogListener(listener: WebSocketLogListener): void {
+    this.logService.addListenerAndEmit(listener);
+  }
+
+  removeLogListener(listener: WebSocketLogListener): void {
+    this.logService.removeListenerByRef(listener);
+  }
+
+  getLogs(): WebSocketLogEntry[] {
+    return this.logService.getEntries();
+  }
+
+  clearLogs(): void {
+    this.logService.clear();
   }
 }

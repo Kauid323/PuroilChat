@@ -4,6 +4,18 @@ import { ChatMessageLayoutFactory, ChatMessageLayoutStyle, ChatRouteParams, Mess
 import { ChatViewModel } from '../viewmodels/ChatViewModel';
 import { NavigationTransition } from '../services/NavigationTransition';
 import { AvatarImageService } from '../services/AvatarImageService';
+import { MarkdownMessage } from '../components/MarkdownMessage';
+
+class MessageRenderMeta {
+  showSenderName: boolean = false;
+  showAvatar: boolean = false;
+  firstInGroup: boolean = true;
+  lastInGroup: boolean = true;
+  topSpacing: number = 0;
+  bottomSpacing: number = 0;
+  displayName: string = '';
+  displayInitial: string = '?';
+}
 
 @Entry
 @Component
@@ -33,8 +45,15 @@ struct Chat {
   @State sending: boolean = false;
   @State remoteDraftText: string = '';
   @State enteringMessageKeys: string[] = [];
+  @State listVisible: boolean = false;
+  @State isAtBottom: boolean = true;
   private firstSyncDone: boolean = false;
   private highlightToken: number = 0;
+  private applyingIncrementalUpdate: boolean = false;
+  private suppressDataSourceReload: boolean = false;
+  private pendingInitialPosition: boolean = true;
+  private messageRenderMeta: MessageRenderMeta[] = [];
+  private messageRenderMetaIndex: Record<string, number> = {};
 
   pageTransition() {
     PageTransitionEnter({ type: RouteType.Push, duration: NavigationTransition.PUSH_ENTER_MS, curve: Curve.Friction })
@@ -58,17 +77,26 @@ struct Chat {
     const params: ChatRouteParams = this.getUIContext().getRouter().getParams() as ChatRouteParams;
     this.vm.bindRoute(params);
     this.vm.onMessagesUpdated = () => {
+      if (this.applyingIncrementalUpdate) {
+        return;
+      }
       this.syncFromVm();
-      this.initialMessageIndex = this.messages.length > 0 ? this.messages.length - 1 : 0;
-      this.applyMessages(this.initialMessageIndex, ScrollAlign.END);
+      if (this.suppressDataSourceReload) {
+        return;
+      }
+      this.messageDataSource.replaceAll(this.messages);
     };
     this.vm.onMessagesAppended = (items: MessageItem[]) => {
+      this.applyingIncrementalUpdate = true;
       this.syncFromVm();
       this.messageDataSource.appendMessages(items);
       this.animateAppendedMessages(items);
       this.initialMessageIndex = this.messages.length > 0 ? this.messages.length - 1 : 0;
       setTimeout(() => {
-        this.scrollToMessageIndex(this.messages.length - 1, ScrollAlign.END);
+        if (this.shouldAutoScrollForAppendedMessages(items)) {
+          this.scrollToMessageIndex(this.messages.length - 1, ScrollAlign.END);
+        }
+        this.applyingIncrementalUpdate = false;
       }, 16);
     };
     this.vm.onRemoteDraftUpdated = () => {
@@ -76,6 +104,9 @@ struct Chat {
     };
     this.layoutStyle = ChatMessageLayoutFactory.create(params.layoutStyleName);
     this.firstSyncDone = false;
+    this.pendingInitialPosition = true;
+    this.listVisible = false;
+    this.isAtBottom = true;
     void this.refreshMessages();
   }
 
@@ -93,6 +124,7 @@ struct Chat {
     this.loadingNewer = this.vm.quoteContext.loadingNewer;
     this.canLoadNewer = this.vm.quoteContext.hasNewer;
     this.inQuoteContext = this.vm.quoteContext.active;
+    this.rebuildMessageRenderMeta();
     this.preloadMessageAvatars();
   }
 
@@ -108,7 +140,12 @@ struct Chat {
       return;
     }
     const previousMessages: MessageItem[] = [...this.messages];
-    await this.vm.loadMoreMessages();
+    this.suppressDataSourceReload = true;
+    try {
+      await this.vm.loadMoreMessages();
+    } finally {
+      this.suppressDataSourceReload = false;
+    }
     this.syncFromVm();
     const prependCount: number = this.messages.length - previousMessages.length;
     if (prependCount <= 0) {
@@ -126,7 +163,12 @@ struct Chat {
       return;
     }
     const previousMessages: MessageItem[] = [...this.messages];
-    await this.vm.loadNewerMessages();
+    this.suppressDataSourceReload = true;
+    try {
+      await this.vm.loadNewerMessages();
+    } finally {
+      this.suppressDataSourceReload = false;
+    }
     this.syncFromVm();
     const appendCount: number = this.messages.length - previousMessages.length;
     if (appendCount <= 0) {
@@ -166,9 +208,18 @@ struct Chat {
     setTimeout(() => {
       this.firstSyncDone = true;
       if (this.messages.length === 0) {
+        this.listVisible = true;
+        this.pendingInitialPosition = false;
+        this.isAtBottom = true;
         return;
       }
       this.locateMessage(highlightMsgId, targetIndex, align);
+      if (this.pendingInitialPosition) {
+        setTimeout(() => {
+          this.listVisible = true;
+          this.pendingInitialPosition = false;
+        }, 40);
+      }
     }, 60);
   }
 
@@ -285,16 +336,96 @@ struct Chat {
     this.animateAppendedMessages(appended);
     this.initialMessageIndex = this.messages.length - 1;
     setTimeout(() => {
-      this.scrollToMessageIndex(this.messages.length - 1, ScrollAlign.END);
+      if (this.shouldAutoScrollForAppendedMessages(appended)) {
+        this.scrollToMessageIndex(this.messages.length - 1, ScrollAlign.END);
+      }
     }, 16);
     return true;
   }
 
+  private shouldAutoScrollForAppendedMessages(items: MessageItem[]): boolean {
+    return items.length > 0 && this.isAtBottom;
+  }
+
   private buildMessageKey(item: MessageItem): string {
+    if (item.uiKey.length > 0) {
+      return item.uiKey;
+    }
     if (item.msgId.length > 0) {
       return item.msgId;
     }
-    return `${item.msgSeq}_${item.sendTime}_${item.senderId}_${item.direction}`;
+    return `${item.msgSeq}_${item.sendTime}_${item.senderId}_${item.direction}_${item.contentType}_${item.contentText.length}`;
+  }
+
+  private resolveConversationTitle(): string {
+    const trimmedTitle: string = this.title.trim();
+    return trimmedTitle.length > 0 ? trimmedTitle : 'Unknown';
+  }
+
+  private updateBottomState(_start: number, end: number): void {
+    if (this.messages.length === 0) {
+      this.isAtBottom = true;
+      return;
+    }
+    this.isAtBottom = end >= this.messages.length - 1;
+  }
+
+  private resolveDisplayName(item: MessageItem): string {
+    const trimmedName: string = item.senderName.trim();
+    if (trimmedName.length > 0) {
+      return trimmedName;
+    }
+    if (item.isSelf) {
+      return '我';
+    }
+    return this.resolveConversationTitle();
+  }
+
+  private resolveDisplayInitial(item: MessageItem): string {
+    const displayName: string = this.resolveDisplayName(item);
+    return displayName.length > 0 ? displayName.slice(0, 1) : '?';
+  }
+
+  private rebuildMessageRenderMeta(): void {
+    const nextMeta: MessageRenderMeta[] = [];
+    const nextIndex: Record<string, number> = {};
+    for (let i = 0; i < this.messages.length; i++) {
+      const item: MessageItem = this.messages[i];
+      const previous: MessageItem | undefined = i > 0 ? this.messages[i - 1] : undefined;
+      const following: MessageItem | undefined = i < this.messages.length - 1 ? this.messages[i + 1] : undefined;
+      const meta: MessageRenderMeta = new MessageRenderMeta();
+      meta.firstInGroup = !this.isSameSenderGroup(previous, item);
+      meta.lastInGroup = !this.isSameSenderGroup(item, following);
+      meta.showSenderName = meta.firstInGroup;
+      meta.showAvatar = !item.isSelf && meta.lastInGroup;
+      meta.topSpacing = i === 0
+        ? this.layoutStyle.edgeSpacing
+        : (this.isSameSenderGroup(previous, item) ? this.layoutStyle.groupedSpacing : this.layoutStyle.separatedSpacing);
+      meta.bottomSpacing = i >= this.messages.length - 1
+        ? this.layoutStyle.edgeSpacing
+        : (this.isSameSenderGroup(item, following) ? this.layoutStyle.groupedSpacing : this.layoutStyle.edgeSpacing);
+      meta.displayName = this.resolveDisplayName(item);
+      meta.displayInitial = this.resolveDisplayInitial(item);
+      nextIndex[this.buildMessageKey(item)] = i;
+      nextMeta.push(meta);
+    }
+    this.messageRenderMeta = nextMeta;
+    this.messageRenderMetaIndex = nextIndex;
+  }
+
+  private getMessageRenderMeta(item: MessageItem): MessageRenderMeta {
+    const index: number | undefined = this.messageRenderMetaIndex[this.buildMessageKey(item)];
+    if (index !== undefined && index >= 0 && index < this.messageRenderMeta.length) {
+      return this.messageRenderMeta[index];
+    }
+    const fallback: MessageRenderMeta = new MessageRenderMeta();
+    fallback.displayName = this.resolveDisplayName(item);
+    fallback.displayInitial = this.resolveDisplayInitial(item);
+    fallback.topSpacing = this.layoutStyle.edgeSpacing;
+    fallback.bottomSpacing = this.layoutStyle.edgeSpacing;
+    fallback.showSenderName = true;
+    fallback.showAvatar = !item.isSelf;
+    return fallback;
   }
 
   private normalizedMessageTime(item: MessageItem): number {
@@ -321,33 +452,12 @@ struct Chat {
     return timeGap <= 5 * 60 * 1000;
   }
 
-  private resolveMessageIndex(item: MessageItem): number {
-    const key: string = this.buildMessageKey(item);
-    for (let i = 0; i < this.messages.length; i++) {
-      if (this.buildMessageKey(this.messages[i]) === key) {
-        return i;
-      }
-    }
-    return -1;
-  }
-
   private shouldShowSenderName(item: MessageItem): boolean {
-    const index: number = this.resolveMessageIndex(item);
-    if (index <= 0) {
-      return true;
-    }
-    return !this.isSameSenderGroup(this.messages[index - 1], item);
+    return this.getMessageRenderMeta(item).showSenderName;
   }
 
   private shouldShowAvatar(item: MessageItem): boolean {
-    if (item.isSelf) {
-      return false;
-    }
-    const index: number = this.resolveMessageIndex(item);
-    if (index < 0 || index >= this.messages.length - 1) {
-      return true;
-    }
-    return !this.isSameSenderGroup(item, this.messages[index + 1]);
+    return this.getMessageRenderMeta(item).showAvatar;
   }
 
   private avatarSlotWidth(): number {
@@ -401,19 +511,11 @@ struct Chat {
   }
 
   private isFirstInGroup(item: MessageItem): boolean {
-    const index: number = this.resolveMessageIndex(item);
-    if (index <= 0) {
-      return true;
-    }
-    return !this.isSameSenderGroup(this.messages[index - 1], item);
+    return this.getMessageRenderMeta(item).firstInGroup;
   }
 
   private isLastInGroup(item: MessageItem): boolean {
-    const index: number = this.resolveMessageIndex(item);
-    if (index < 0 || index >= this.messages.length - 1) {
-      return true;
-    }
-    return !this.isSameSenderGroup(item, this.messages[index + 1]);
+    return this.getMessageRenderMeta(item).lastInGroup;
   }
 
   private bubbleRadius(item: MessageItem): BorderRadiuses {
@@ -441,19 +543,11 @@ struct Chat {
   }
 
   private topSpacing(item: MessageItem): number {
-    const index: number = this.resolveMessageIndex(item);
-    if (index <= 0) {
-      return this.layoutStyle.edgeSpacing;
-    }
-    return this.isSameSenderGroup(this.messages[index - 1], item) ? this.layoutStyle.groupedSpacing : this.layoutStyle.separatedSpacing;
+    return this.getMessageRenderMeta(item).topSpacing;
   }
 
   private bottomSpacing(item: MessageItem): number {
-    const index: number = this.resolveMessageIndex(item);
-    if (index < 0 || index >= this.messages.length - 1) {
-      return this.layoutStyle.edgeSpacing;
-    }
-    return this.isSameSenderGroup(item, this.messages[index + 1]) ? this.layoutStyle.groupedSpacing : this.layoutStyle.edgeSpacing;
+    return this.getMessageRenderMeta(item).bottomSpacing;
   }
 
   private findMessageIndexById(list: MessageItem[], msgId: string): number {
@@ -482,17 +576,12 @@ struct Chat {
     }
     this.sending = true;
     try {
-      const previousMessages: MessageItem[] = [...this.messages];
       const sent: boolean = await this.vm.sendTextMessage(messageText);
       this.syncFromVm();
       if (!sent) {
         return;
       }
       this.draftMessage = '';
-      if (!this.applyIncrementalTailMessages(previousMessages)) {
-        this.initialMessageIndex = this.messages.length > 0 ? this.messages.length - 1 : 0;
-        this.applyMessages(this.initialMessageIndex, ScrollAlign.END);
-      }
     } finally {
       this.sending = false;
     }
@@ -583,7 +672,7 @@ struct Chat {
           .width(this.layoutStyle.avatarSize)
           .height(this.layoutStyle.avatarSize)
           .fill('#D8E7FF')
-        Text(item.senderName.length > 0 ? item.senderName.slice(0, 1) : '?')
+        Text(this.getMessageRenderMeta(item).displayInitial)
           .fontSize(13)
           .fontWeight(FontWeight.Bold)
           .fontColor('#1769FF')
@@ -631,11 +720,17 @@ struct Chat {
         this.quoteCard(item)
       }
 
-      Text(item.contentText.length > 0 ? item.contentText : '[暂不支持的消息]')
-        .fontSize(15)
-        .fontColor(item.isSelf ? '#FFFFFF' : '#111827')
-        .maxLines(100)
-        .copyOption(CopyOptions.LocalDevice)
+      if (item.contentType === 3) {
+        MarkdownMessage({
+          text: item.contentText.length > 0 ? item.contentText : '',
+          isSelf: item.isSelf
+        })
+      } else {
+        Text(item.contentText.length > 0 ? item.contentText : '[暂不支持的消息]')
+          .fontSize(15)
+          .fontColor(item.isSelf ? '#FFFFFF' : '#111827')
+          .copyOption(CopyOptions.LocalDevice)
+      }
     }
     .alignItems(HorizontalAlign.Start)
     .padding({
@@ -659,7 +754,7 @@ struct Chat {
                 Text(this.formatMessageTime(item.sendTime))
                   .fontSize(10)
                   .fontColor('#98A2B3')
-                Text(item.senderName.length > 0 ? item.senderName : '我')
+                Text(this.getMessageRenderMeta(item).displayName)
                   .fontSize(11)
                   .fontColor('#7B8496')
               }
@@ -697,7 +792,7 @@ struct Chat {
           Column({ space: 0 }) {
             if (this.shouldShowSenderName(item)) {
               Row({ space: 6 }) {
-                Text(item.senderName.length > 0 ? item.senderName : this.title)
+                Text(this.getMessageRenderMeta(item).displayName)
                   .fontSize(11)
                   .fontColor('#7B8496')
                 Text(this.formatMessageTime(item.sendTime))
@@ -747,7 +842,7 @@ struct Chat {
           })
 
         Column({ space: 2 }) {
-          Text(this.title.length > 0 ? this.title : 'Chat')
+          Text(this.resolveConversationTitle())
             .fontSize(18)
             .fontWeight(FontWeight.Bold)
             .fontColor('#111827')
@@ -818,9 +913,12 @@ struct Chat {
           ListItem() {
             this.messageBubble(item)
           }
-        }, (item: MessageItem) => item.msgId.length > 0 ? item.msgId : `${item.msgSeq}_${item.sendTime}`)
+        }, (item: MessageItem) => this.buildMessageKey(item))
       }
       .maintainVisibleContentPosition(true)
+      .onScrollIndex((start: number, end: number, _center: number) => {
+        this.updateBottomState(start, end);
+      })
       .onReachStart(() => {
         if (!this.firstSyncDone) {
           return;
@@ -828,11 +926,13 @@ struct Chat {
         void this.loadMoreMessages();
       })
       .onReachEnd(() => {
+        this.isAtBottom = true;
         if (!this.firstSyncDone || !this.inQuoteContext) {
           return;
         }
         void this.loadNewerMessages();
       })
+      .opacity(this.listVisible ? 1 : 0)
       .layoutWeight(1)
       .width('100%')
       .padding({ left: this.layoutStyle.listSidePadding, right: this.layoutStyle.listSidePadding, top: 0, bottom: 0 })

@@ -93,5 +93,14 @@ export class WebSocketEvent {
   botBoard: WebSocketBotBoardUpdate | undefined = undefined;
 }
 
+export class WebSocketLogEntry {
+  id: string = '';
+  timestamp: number = 0;
+  level: string = 'info';
+  tag: string = 'ws';
+  message: string = '';
+}
+
 export type WebSocketConnectionListener = (state: WebSocketConnectionState) => void;
 export type WebSocketEventListener = (event: WebSocketEvent) => void;
+export type WebSocketLogListener = (entries: WebSocketLogEntry[]) => void;

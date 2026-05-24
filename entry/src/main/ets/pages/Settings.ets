@@ -1,6 +1,6 @@
 import { NavigationTransition } from '../services/NavigationTransition';
 import { MeViewModel } from '../viewmodels/MeViewModel';
-import { ChatStyleOption } from '../models/MeModels';
+import { ChatStyleOption, WebSocketLogViewItem, WebSocketStatusViewState } from '../models/MeModels';
 
 @Component
 @Entry
@@ -10,6 +10,8 @@ struct Settings {
   @State styleOptions: ChatStyleOption[] = [];
   @State activeStyleKey: string = '';
   @State activeActionKey: string = '';
+  @State webSocketLogs: WebSocketLogViewItem[] = [];
+  @State webSocketStatus: WebSocketStatusViewState = new WebSocketStatusViewState();
 
   pageTransition() {
     PageTransitionEnter({ type: RouteType.Push, duration: NavigationTransition.PUSH_ENTER_MS, curve: Curve.Friction })
@@ -32,6 +34,19 @@ struct Settings {
   aboutToAppear(): void {
     this.selectedChatStyle = this.vm.settings.selectedChatStyle;
     this.styleOptions = [...this.vm.settings.styleOptions];
+    this.vm.onWebSocketLogsUpdated = () => {
+      this.webSocketLogs = [...this.vm.webSocketLogs];
+    };
+    this.vm.onWebSocketStatusUpdated = () => {
+      this.webSocketStatus = this.vm.webSocketStatus;
+    };
+    this.vm.bindWebSocketLogs();
+    this.webSocketLogs = [...this.vm.webSocketLogs];
+    this.webSocketStatus = this.vm.webSocketStatus;
+  }
+
+  aboutToDisappear(): void {
+    this.vm.unbindWebSocketLogs();
   }
 
   private isStyleSelected(styleKey: string): boolean {
@@ -72,6 +87,76 @@ struct Settings {
       this.getUIContext().getRouter().back();
     } catch (_error) {
     }
+  }
+
+  private clearLogs(): void {
+    this.vm.clearWebSocketLogs();
+    this.webSocketLogs = [...this.vm.webSocketLogs];
+  }
+
+  private statusColor(): string {
+    if (this.webSocketStatus.status === 'connected') {
+      return '#039855';
+    }
+    if (this.webSocketStatus.status === 'connecting') {
+      return '#0A84FF';
+    }
+    if (this.webSocketStatus.status === 'error') {
+      return '#E5484D';
+    }
+    return '#667085';
+  }
+
+  private async startWebSocket(): Promise<void> {
+    this.activeActionKey = 'ws-start';
+    try {
+      await this.vm.startWebSocket();
+    } catch (_error) {
+    } finally {
+      setTimeout(() => {
+        if (this.activeActionKey === 'ws-start') {
+          this.activeActionKey = '';
+        }
+      }, 140);
+    }
+  }
+
+  private async stopWebSocket(): Promise<void> {
+    this.activeActionKey = 'ws-stop';
+    try {
+      await this.vm.stopWebSocket();
+    } catch (_error) {
+    } finally {
+      setTimeout(() => {
+        if (this.activeActionKey === 'ws-stop') {
+          this.activeActionKey = '';
+        }
+      }, 140);
+    }
+  }
+
+  private async restartWebSocket(): Promise<void> {
+    this.activeActionKey = 'ws-restart';
+    try {
+      await this.vm.restartWebSocket();
+    } catch (_error) {
+    } finally {
+      setTimeout(() => {
+        if (this.activeActionKey === 'ws-restart') {
+          this.activeActionKey = '';
+        }
+      }, 140);
+    }
+  }
+
+  private logLevelColor(level: string): string {
+    if (level === 'error') {
+      return '#E5484D';
+    }
+    if (level === 'warn') {
+      return '#F79009';
+    }
+    return '#0A84FF';
   }
 
   @Builder
@@ -146,6 +231,38 @@ struct Settings {
     })
   }
 
+  @Builder
+  webSocketLogCard(item: WebSocketLogViewItem) {
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        Text(item.timeText)
+          .fontSize(11)
+          .fontColor('#667085')
+        Text(item.level.toUpperCase())
+          .fontSize(10)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.logLevelColor(item.level))
+        Text(item.tag)
+          .fontSize(10)
+          .fontColor('#344054')
+      }
+      .width('100%')
+
+      Text(item.message)
+        .width('100%')
+        .fontSize(12)
+        .fontColor('#101828')
+        .textAlign(TextAlign.Start)
+        .copyOption(CopyOptions.LocalDevice)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(12)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(14)
+    .border({ width: 1, color: '#EEF2F6' })
+  }
+
   build() {
     Column({ space: 0 }) {
       Row({ space: 10 }) {
@@ -193,6 +310,139 @@ struct Settings {
             this.actionCard('退出登录', '#E5484D', '#FFECEC', 'logout', () => {
               void this.logout();
             })
+          }
+          .width('100%')
+
+          Column({ space: 10 }) {
+            Text('WebSocket 状态')
+              .fontSize(17)
+              .fontWeight(FontWeight.Medium)
+              .fontColor('#101828')
+              .width('100%')
+              .textAlign(TextAlign.Start)
+
+            Column({ space: 8 }) {
+              Row({ space: 8 }) {
+                Text('status')
+                  .fontSize(12)
+                  .fontColor('#667085')
+                Text(this.webSocketStatus.status)
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(this.statusColor())
+              }
+              .width('100%')
+
+              Row({ space: 8 }) {
+                Text('started')
+                  .fontSize(12)
+                  .fontColor('#667085')
+                Text(this.webSocketStatus.started ? 'true' : 'false')
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#101828')
+              }
+              .width('100%')
+
+              Row({ space: 8 }) {
+                Text('reconnect')
+                  .fontSize(12)
+                  .fontColor('#667085')
+                Text(`${this.webSocketStatus.reconnectAttempt}`)
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#101828')
+              }
+              .width('100%')
+
+              Text(this.webSocketStatus.message.length > 0 ? this.webSocketStatus.message : '-')
+                .width('100%')
+                .fontSize(12)
+                .fontColor('#344054')
+                .copyOption(CopyOptions.LocalDevice)
+            }
+            .width('100%')
+            .padding(14)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(18)
+            .border({ width: 1, color: '#EEF2F6' })
+
+            Row({ space: 8 }) {
+              Button('启动')
+                .layoutWeight(1)
+                .height(34)
+                .fontSize(13)
+                .backgroundColor('#EAF3FF')
+                .fontColor('#0A84FF')
+                .borderRadius(17)
+                .onClick(() => {
+                  void this.startWebSocket();
+                })
+
+              Button('停止')
+                .layoutWeight(1)
+                .height(34)
+                .fontSize(13)
+                .backgroundColor('#FFF1F3')
+                .fontColor('#E5484D')
+                .borderRadius(17)
+                .onClick(() => {
+                  void this.stopWebSocket();
+                })
+
+              Button('重连')
+                .layoutWeight(1)
+                .height(34)
+                .fontSize(13)
+                .backgroundColor('#EEF2FF')
+                .fontColor('#4F46E5')
+                .borderRadius(17)
+                .onClick(() => {
+                  void this.restartWebSocket();
+                })
+            }
+            .width('100%')
+          }
+          .width('100%')
+
+          Column({ space: 10 }) {
+            Row() {
+              Text('WebSocket 实时日志')
+                .fontSize(17)
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#101828')
+              Blank()
+              Button('清空')
+                .fontSize(12)
+                .height(30)
+                .backgroundColor('#EAF3FF')
+                .fontColor('#0A84FF')
+                .borderRadius(15)
+                .onClick(() => {
+                  this.clearLogs();
+                })
+            }
+            .width('100%')
+
+            Text(`共 ${this.webSocketLogs.length} 条`)
+              .width('100%')
+              .fontSize(12)
+              .fontColor('#667085')
+
+            if (this.webSocketLogs.length === 0) {
+              Text('暂无日志')
+                .width('100%')
+                .fontSize(13)
+                .fontColor('#98A2B3')
+                .padding({ top: 8, bottom: 8 })
+            } else {
+              Column({ space: 8 }) {
+                ForEach(this.webSocketLogs, (item: WebSocketLogViewItem) => {
+                  this.webSocketLogCard(item)
+                }, (item: WebSocketLogViewItem) => item.id)
+              }
+              .width('100%')
+            }
           }
           .width('100%')
         }

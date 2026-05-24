@@ -6,6 +6,7 @@ export class ChatRouteParams {
 }
 
 export class MessageItem {
+  uiKey: string = '';
   msgId: string = '';
   chatId: string = '';
   senderId: string = '';

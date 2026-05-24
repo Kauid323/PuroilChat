@@ -30,6 +30,7 @@ import {
 } from '../generated/proto/chat_ws_go';
 import { MessageItem } from '../models/ChatModels';
 import { AvatarImageService } from './AvatarImageService';
+import { WebSocketLogService } from './WebSocketLogService';
 
 const UTF8_ENCODER: util.TextEncoder = util.TextEncoder.create('utf-8');
 const LOGIN_CMD: string = 'login';
@@ -45,6 +46,7 @@ class EmptyWsPayload {
 
 export class WebSocketService {
   private readonly routeService: MiscService = new MiscService();
+  private readonly logService: WebSocketLogService = WebSocketLogService.getInstance();
   private socket: webSocket.WebSocket | undefined = undefined;
   private routeConfig: WebSocketRouteConfig | undefined = undefined;
   private heartbeatTimer: number = -1;
@@ -59,30 +61,42 @@ export class WebSocketService {
   private state: WebSocketConnectionState = new WebSocketConnectionState();
   private connectionListeners: WebSocketConnectionListener[] = [];
   private eventListeners: WebSocketEventListener[] = [];
-  private readonly onOpenCallback: AsyncCallback<Object> = (_err, _value) => {
+  private readonly onOpenCallback: AsyncCallback<Object> = (err, value) => {
     this.isConnecting = false;
     this.reconnectAttempt = 0;
+    this.logService.info('socket/open',
+      `websocket opened err=${JSON.stringify(err ?? {})} value=${JSON.stringify(value ?? {})}`);
     this.updateState(WebSocketConnectionStatus.CONNECTED, '');
     void this.sendLogin();
     this.startHeartbeat();
   };
   private readonly onMessageCallback: AsyncCallback<string | ArrayBuffer> = (_err, value) => {
     if (typeof value === 'string') {
+      this.logService.info('socket/message', `received text frame length=${value.length}`);
       return;
     }
     const binary: Uint8Array = new Uint8Array(value);
+    this.logService.info('socket/message', `received binary frame bytes=${binary.byteLength}`);
     this.handleBinaryMessage(binary);
   };
-  private readonly onCloseCallback: AsyncCallback<webSocket.CloseResult> = (_err, value) => {
+  private readonly onCloseCallback: AsyncCallback<webSocket.CloseResult> = (err, value) => {
     this.stopHeartbeat();
     this.socket = undefined;
     this.isConnecting = false;
+    this.logService.warn('socket/close',
+      `closed err=${JSON.stringify(err ?? {})} value=${JSON.stringify(value ?? {})}`);
     this.updateState(WebSocketConnectionStatus.DISCONNECTED, value?.reason ?? '');
     this.scheduleReconnect();
   };
   private readonly onErrorCallback = (error: BusinessError): void => {
     this.stopHeartbeat();
     this.isConnecting = false;
+    this.logService.error('socket/error', JSON.stringify({
+      code: error.code ?? 0,
+      message: error.message ?? 'websocket error',
+      name: (error as Error).name ?? '',
+      stack: (error as Error).stack ?? ''
+    }));
     this.updateState(WebSocketConnectionStatus.ERROR, error.message ?? 'websocket error');
     this.scheduleReconnect();
   };
@@ -97,6 +111,7 @@ export class WebSocketService {
     this.state.status = status;
     this.state.message = message;
     this.state.reconnectAttempt = this.reconnectAttempt;
+    this.logService.info('socket/state', `status=${status} reconnectAttempt=${this.reconnectAttempt} message=${message}`);
     const snapshot: WebSocketConnectionState = new WebSocketConnectionState();
     snapshot.status = this.state.status;
     snapshot.message = this.state.message;
@@ -136,12 +151,25 @@ export class WebSocketService {
 
   private mapPushMessageToItem(source: import('../generated/proto/chat_ws_go').WsMsg, isEdited: boolean = false): MessageItem {
     const item: MessageItem = new MessageItem();
+    const sourceChatId: string = source.chatId ?? '';
+    const senderChatId: string = source.sender?.chatId ?? '';
+    const recvId: string = source.recvId ?? '';
+    const isPrivateChat: boolean = sourceChatId.length > 0 && recvId.length > 0 && sourceChatId === recvId;
+    let targetChatId: string = sourceChatId;
+    if (isPrivateChat && senderChatId.length > 0) {
+      if (senderChatId === this.currentUserId) {
+        targetChatId = recvId;
+      } else {
+        targetChatId = senderChatId;
+      }
+    }
     item.msgId = source.msgId ?? '';
-    item.chatId = source.chatId ?? '';
-    item.senderId = source.sender?.chatId ?? '';
+    item.uiKey = item.msgId;
+    item.chatId = targetChatId;
+    item.senderId = senderChatId;
     item.senderName = source.sender?.name ?? '';
     item.senderAvatarUrl = AvatarImageService.normalizeAvatarUrl(source.sender?.avatarUrl ?? '');
-    item.direction = source.sender?.chatId === this.currentUserId ? 'right' : 'left';
+    item.direction = senderChatId === this.currentUserId ? 'right' : 'left';
     item.contentText = source.content?.text ?? source.content?.callText ?? source.content?.postTitle ?? '';
     item.rawText = item.contentText;
     item.quoteMsgId = source.quoteMsgId ?? '';
@@ -151,6 +179,11 @@ export class WebSocketService {
     item.msgSeq = source.msgSeq ?? 0;
     item.contentType = source.contentType ?? 0;
     item.isSelf = item.direction === 'right';
+    if (item.uiKey.length === 0) {
+      item.uiKey = `${item.msgSeq}_${item.sendTime}_${item.senderId}_${item.direction}_${item.contentType}_${item.contentText.length}`;
+    }
+    this.logService.info('socket/map_message',
+      `rawChatId=${sourceChatId} recvId=${recvId} senderChatId=${senderChatId} normalizedChatId=${item.chatId} isPrivateChat=${isPrivateChat}`);
     return item;
   }
 
@@ -159,23 +192,31 @@ export class WebSocketService {
     try {
       ack = decodeHeartbeatAck(binary);
     } catch (_error) {
+      this.logService.warn('socket/decode', `failed to decode heartbeat envelope bytes=${binary.byteLength}`);
       return;
     }
 
     const cmd: string = ack.info?.cmd ?? '';
     if (cmd.length === 0) {
+      this.logService.warn('socket/decode', 'decoded frame without cmd');
       return;
     }
 
+    this.logService.info('socket/cmd', `cmd=${cmd}`);
+
     if (cmd === 'heartbeat_ack' || cmd === 'login_ack') {
+      this.logService.info('socket/ack', `ack=${cmd}`);
       return;
     }
 
     if (cmd === 'push_message') {
       const decoded = decodePushMessage(binary);
       if (decoded.data?.msg === undefined) {
+        this.logService.warn('socket/push_message', 'frame has no msg payload');
         return;
       }
+      this.logService.info('socket/push_message',
+        `chatId=${decoded.data.msg.chatId ?? ''} msgId=${decoded.data.msg.msgId ?? ''} seq=${decoded.data.msg.msgSeq ?? 0}`);
       const event: WebSocketEvent = new WebSocketEvent();
       event.type = WebSocketEventType.MESSAGE;
       event.message = this.mapPushMessageToItem(decoded.data.msg, false);
@@ -186,8 +227,11 @@ export class WebSocketService {
     if (cmd === 'edit_message') {
       const decoded = decodeEditMessage(binary);
       if (decoded.data?.msg === undefined) {
+        this.logService.warn('socket/edit_message', 'frame has no msg payload');
         return;
       }
+      this.logService.info('socket/edit_message',
+        `chatId=${decoded.data.msg.chatId ?? ''} msgId=${decoded.data.msg.msgId ?? ''} seq=${decoded.data.msg.msgSeq ?? 0}`);
       const event: WebSocketEvent = new WebSocketEvent();
       event.type = WebSocketEventType.MESSAGE_EDITED;
       event.message = this.mapPushMessageToItem(decoded.data.msg, true);
@@ -198,8 +242,11 @@ export class WebSocketService {
     if (cmd === 'draft_input') {
       const decoded = decodeDraftInput(binary);
       if (decoded.data?.draft === undefined) {
+        this.logService.warn('socket/draft_input', 'frame has no draft payload');
         return;
       }
+      this.logService.info('socket/draft_input',
+        `chatId=${decoded.data.draft.chatId ?? ''} inputLength=${(decoded.data.draft.input ?? '').length}`);
       const draft: WebSocketDraftUpdate = new WebSocketDraftUpdate();
       draft.chatId = decoded.data.draft.chatId ?? '';
       draft.input = decoded.data.draft.input ?? '';
@@ -214,8 +261,11 @@ export class WebSocketService {
     if (cmd === 'stream_message') {
       const decoded = decodeStreamMessage(binary);
       if (decoded.data?.msg === undefined) {
+        this.logService.warn('socket/stream_message', 'frame has no stream payload');
         return;
       }
+      this.logService.info('socket/stream_message',
+        `chatId=${decoded.data.msg.chatId ?? ''} msgId=${decoded.data.msg.msgId ?? ''} chunkLength=${(decoded.data.msg.content ?? '').length}`);
       const stream: WebSocketStreamUpdate = new WebSocketStreamUpdate();
       stream.msgId = decoded.data.msg.msgId ?? '';
       stream.recvId = decoded.data.msg.recvId ?? '';
@@ -231,8 +281,11 @@ export class WebSocketService {
     if (cmd === 'bot_board_message') {
       const decoded = decodeBotBoardMessage(binary);
       if (decoded.data?.board === undefined) {
+        this.logService.warn('socket/bot_board_message', 'frame has no board payload');
         return;
       }
+      this.logService.info('socket/bot_board_message',
+        `chatId=${decoded.data.board.chatId ?? ''} botId=${decoded.data.board.botId ?? ''} contentType=${decoded.data.board.contentType ?? 0}`);
       const board: WebSocketBotBoardUpdate = new WebSocketBotBoardUpdate();
       board.botId = decoded.data.board.botId ?? '';
       board.chatId = decoded.data.board.chatId ?? '';
@@ -260,6 +313,7 @@ export class WebSocketService {
 
   private async sendTextEnvelope<T>(cmd: string, data: T): Promise<void> {
     if (this.socket === undefined) {
+      this.logService.error('socket/send', `blocked cmd=${cmd} reason=not_connected`);
       throw new Error('websocket is not connected');
     }
     const envelope: WsRequestEnvelope<T> = new WsRequestEnvelope<T>();
@@ -267,9 +321,11 @@ export class WebSocketService {
     envelope.cmd = cmd;
     envelope.data = data;
     try {
+      this.logService.info('socket/send', `cmd=${cmd} payload=${JSON.stringify(data)}`);
       await this.socket.send(JSON.stringify(envelope));
     } catch (error) {
       const err: Error = error as Error;
+      this.logService.error('socket/send', `cmd=${cmd} failed message=${err.message || 'websocket send failed'}`);
       throw new Error(err.message || 'websocket send failed');
     }
   }
@@ -291,11 +347,13 @@ export class WebSocketService {
     if (this.heartbeatTimer >= 0) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = -1;
+      this.logService.info('socket/heartbeat', 'heartbeat stopped');
     }
   }
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    this.logService.info('socket/heartbeat', `heartbeat started intervalMs=${HEARTBEAT_INTERVAL_MS}`);
     this.heartbeatTimer = setInterval(() => {
       void this.sendHeartbeat();
     }, HEARTBEAT_INTERVAL_MS);
@@ -303,14 +361,17 @@ export class WebSocketService {
 
   private scheduleReconnect(): void {
     if (!this.shouldReconnect || this.currentUserId.length === 0 || this.currentToken.length === 0) {
+      this.logService.info('socket/reconnect', 'skip reconnect because reconnect is disabled or auth is empty');
       return;
     }
     if (this.reconnectTimer >= 0) {
+      this.logService.info('socket/reconnect', 'reconnect already scheduled');
       return;
     }
     this.reconnectAttempt += 1;
     const shift: number = this.reconnectAttempt > 4 ? 4 : this.reconnectAttempt;
     const delay: number = Math.min(BASE_RECONNECT_DELAY_MS * Math.pow(2, shift - 1), MAX_RECONNECT_DELAY_MS);
+    this.logService.warn('socket/reconnect', `schedule reconnect attempt=${this.reconnectAttempt} delayMs=${delay}`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = -1;
       void this.connect(this.currentUserId);
@@ -321,6 +382,7 @@ export class WebSocketService {
     if (this.reconnectTimer >= 0) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = -1;
+      this.logService.info('socket/reconnect', 'clear pending reconnect');
     }
   }
 
@@ -340,9 +402,11 @@ export class WebSocketService {
 
   private async ensureRouteConfig(): Promise<void> {
     if (this.routeConfig !== undefined && this.routeConfig.websocketUrl.length > 0) {
+      this.logService.info('socket/route', `reuse websocketUrl=${this.routeConfig.websocketUrl}`);
       return;
     }
     this.routeConfig = await this.routeService.getWebSocketRoute();
+    this.logService.info('socket/route', `fetched websocketUrl=${this.routeConfig.websocketUrl}`);
   }
 
   async connect(userId: string): Promise<void> {
@@ -354,6 +418,7 @@ export class WebSocketService {
       throw new Error('token is empty');
     }
     if (this.state.status === WebSocketConnectionStatus.CONNECTED || this.isConnecting) {
+      this.logService.info('socket/connect', `skip connect status=${this.state.status} isConnecting=${this.isConnecting}`);
       return;
     }
 
@@ -364,6 +429,7 @@ export class WebSocketService {
     this.clearReconnect();
     this.stopHeartbeat();
     this.isConnecting = true;
+    this.logService.info('socket/connect', `connect begin userId=${userId} platform=${WINDOWS_PLATFORM} deviceId=${this.deviceId}`);
     this.updateState(WebSocketConnectionStatus.CONNECTING, '');
 
     await this.ensureRouteConfig();
@@ -371,17 +437,33 @@ export class WebSocketService {
     this.bindSocketEvents(socket);
     this.socket = socket;
     try {
-      await socket.connect(this.routeConfig?.websocketUrl ?? '', {
-        header: {
-          token: token,
-          'device-id': this.deviceId
-        }
+      const connectOptions: webSocket.WebSocketRequestOptions = {
+        skipServerCertVerification: true
+      };
+      this.logService.info('socket/connect',
+        `connecting url=${this.routeConfig?.websocketUrl ?? ''} headers=none login_after_open=true skipServerCertVerification=true`);
+      await new Promise<void>((resolve, reject) => {
+        socket.connect(this.routeConfig?.websocketUrl ?? '', connectOptions, (err, result) => {
+          this.logService.info('socket/connect_callback',
+            `err=${JSON.stringify(err ?? {})} result=${JSON.stringify(result ?? false)}`);
+          if (err !== undefined && err !== null) {
+            reject(err);
+            return;
+          }
+          resolve();
+        });
       });
     } catch (error) {
       this.unbindSocketEvents(socket);
       this.socket = undefined;
       this.isConnecting = false;
-      const err: Error = error as Error;
+      const err: BusinessError = error as BusinessError;
+      this.logService.error('socket/connect', JSON.stringify({
+        code: err.code ?? 0,
+        message: err.message ?? 'websocket connect failed',
+        name: (err as Error).name ?? '',
+        stack: (err as Error).stack ?? ''
+      }));
       this.updateState(WebSocketConnectionStatus.ERROR, err.message || 'websocket connect failed');
       this.scheduleReconnect();
     }
@@ -392,13 +474,16 @@ export class WebSocketService {
     this.clearReconnect();
     this.stopHeartbeat();
     this.isConnecting = false;
+    this.logService.info('socket/disconnect', 'disconnect begin');
     const socket: webSocket.WebSocket | undefined = this.socket;
     this.socket = undefined;
     if (socket !== undefined) {
       this.unbindSocketEvents(socket);
       try {
         await socket.close({ code: 1000, reason: 'disconnect' });
+        this.logService.info('socket/disconnect', 'socket close requested');
       } catch (_error) {
+        this.logService.warn('socket/disconnect', 'socket close threw');
       }
     }
     this.updateState(WebSocketConnectionStatus.DISCONNECTED, '');

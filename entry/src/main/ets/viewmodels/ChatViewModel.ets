@@ -1,15 +1,19 @@
 import { ChatPaginationState, ChatQuoteContextState, ChatRouteParams, MessageItem } from '../models/ChatModels';
-import { MessageService } from '../services/MessageService';
+import { UserProfile } from '../models/MeModels';
+import { MessageService, SentTextMessageReceipt } from '../services/MessageService';
+import { UserService } from '../services/UserService';
 import { WebSocketManager } from '../services/WebSocketManager';
 import { WebSocketDraftUpdate, WebSocketEvent, WebSocketEventType } from '../models/WebSocketModels';
 
 export class ChatViewModel {
   private readonly messageService = new MessageService();
+  private readonly userService = new UserService();
   private readonly webSocketManager = WebSocketManager.getInstance();
   private mainMessages: MessageItem[] = [];
   private quoteMessages: MessageItem[] = [];
   private mainPagination: ChatPaginationState = new ChatPaginationState();
   private quotePagination: ChatPaginationState = new ChatPaginationState();
+  private currentUserProfile: UserProfile | undefined = undefined;
   private readonly onSocketEvent = (event: WebSocketEvent): void => {
     this.handleSocketEvent(event);
   };
@@ -33,6 +37,7 @@ export class ChatViewModel {
     this.chatType = params.chatType;
     this.title = params.title;
     this.webSocketManager.addEventListener(this.onSocketEvent);
+    void this.ensureRealtimeReady();
   }
 
   async loadMessages(): Promise<void> {
@@ -123,14 +128,16 @@ export class ChatViewModel {
     this.loading = true;
     this.errorMessage = '';
     try {
-      await this.messageService.sendTextMessage(this.chatId, this.chatType, trimmedText);
-      await this.loadMessages();
+      const receipt: SentTextMessageReceipt = await this.messageService.sendTextMessage(this.chatId, this.chatType, trimmedText);
+      const selfMessage: MessageItem = await this.buildLocalSentTextMessage(receipt);
+      this.applyIncomingMessage(selfMessage);
       return true;
     } catch (error) {
       const err: Error = error as Error;
       this.errorMessage = err.message || 'send message failed';
-      this.loading = false;
       return false;
+    } finally {
+      this.loading = false;
     }
   }
 
@@ -437,6 +444,59 @@ export class ChatViewModel {
     target.oldestMsgId = oldest.msgId;
     target.oldestMsgSeq = oldest.msgSeq;
     target.hasMore = oldest.msgId.length > 0;
+  }
+
+  private async ensureRealtimeReady(): Promise<void> {
+    if (!this.webSocketManager.isStarted()) {
+      try {
+        await this.webSocketManager.start();
+      } catch (_error) {
+      }
+    }
+    if (this.currentUserProfile === undefined) {
+      try {
+        this.currentUserProfile = await this.userService.getMyUserInfo();
+      } catch (_error) {
+      }
+    }
+  }
+
+  private async ensureCurrentUserProfile(): Promise<UserProfile> {
+    if (this.currentUserProfile !== undefined && this.currentUserProfile.id.length > 0) {
+      return this.currentUserProfile;
+    }
+    this.currentUserProfile = await this.userService.getMyUserInfo();
+    return this.currentUserProfile;
+  }
+
+  private async buildLocalSentTextMessage(receipt: SentTextMessageReceipt): Promise<MessageItem> {
+    const profile: UserProfile = await this.ensureCurrentUserProfile();
+    const item: MessageItem = new MessageItem();
+    item.uiKey = receipt.msgId;
+    item.msgId = receipt.msgId;
+    item.chatId = receipt.chatId;
+    item.senderId = profile.id;
+    item.senderName = profile.name.length > 0 ? profile.name : '我';
+    item.senderAvatarUrl = profile.avatarUrl;
+    item.direction = 'right';
+    item.contentText = receipt.text;
+    item.rawText = receipt.text;
+    item.sendTime = receipt.sendTime;
+    item.contentType = receipt.contentType;
+    item.isSelf = true;
+    item.msgSeq = this.nextLocalMsgSeq();
+    if (item.uiKey.length === 0) {
+      item.uiKey = `${item.msgSeq}_${item.sendTime}_${item.senderId}_${item.direction}_${item.contentType}_${item.contentText.length}`;
+    }
+    return item;
+  }
+
+  private nextLocalMsgSeq(): number {
+    if (this.mainMessages.length === 0) {
+      return 1;
+    }
+    const latest: MessageItem = this.mainMessages[this.mainMessages.length - 1];
+    return latest.msgSeq + 1;
   }
 
   private handleSocketEvent(event: WebSocketEvent): void {

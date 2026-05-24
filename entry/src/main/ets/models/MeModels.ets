@@ -38,6 +38,21 @@ export class MeSettingsState {
   styleOptions: ChatStyleOption[] = [];
 }
 
+export class WebSocketLogViewItem {
+  id: string = '';
+  timeText: string = '';
+  level: string = 'info';
+  tag: string = '';
+  message: string = '';
+}
+
+export class WebSocketStatusViewState {
+  status: string = 'idle';
+  message: string = '';
+  reconnectAttempt: number = 0;
+  started: boolean = false;
+}
+
 export class ProfileMetricItem {
   label: string = '';
   value: string = '';
