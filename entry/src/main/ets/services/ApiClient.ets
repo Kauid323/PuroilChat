@@ -76,6 +76,38 @@ export class ApiClient {
     }
   }
 
+  static async getJson<T>(path: string): Promise<T> {
+    const request: http.HttpRequest = http.createHttp();
+    try {
+      const options: http.HttpRequestOptions = {
+        method: http.RequestMethod.GET,
+        header: ApiClient.buildJsonHeaders(),
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: 12000,
+        readTimeout: 12000
+      };
+      let response: http.HttpResponse;
+      try {
+        response = await request.request(`${AppConfig.API_BASE}${path}`, options);
+      } catch (error) {
+        const err: Error = error as Error;
+        throw new Error(err.message || 'json request failed');
+      }
+      if (response.responseCode < 200 || response.responseCode >= 300) {
+        throw new Error(`HTTP ${response.responseCode}`);
+      }
+      if (typeof response.result !== 'string') {
+        throw new Error('Invalid JSON response type');
+      }
+      return JSON.parse(response.result) as T;
+    } finally {
+      try {
+        request.destroy();
+      } catch (_error) {
+      }
+    }
+  }
+
   static async postProto(path: string): Promise<Uint8Array> {
     const request: http.HttpRequest = http.createHttp();
     try {

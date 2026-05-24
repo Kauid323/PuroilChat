@@ -4,10 +4,12 @@ import { AvatarImageService } from '../services/AvatarImageService';
 import { CryptoTokenStore } from '../services/CryptoTokenStore';
 import { SettingsStore } from '../services/SettingsStore';
 import { UserService } from '../services/UserService';
+import { WebSocketManager } from '../services/WebSocketManager';
 
 export class MeViewModel {
   private readonly userService = new UserService();
   private readonly avatarService = new AvatarImageService();
+  private readonly webSocketManager = WebSocketManager.getInstance();
 
   loading: boolean = false;
   errorMessage: string = '';
@@ -76,6 +78,7 @@ export class MeViewModel {
   }
 
   logout(): void {
+    void this.webSocketManager.stop();
     CryptoTokenStore.clearToken();
   }
 }

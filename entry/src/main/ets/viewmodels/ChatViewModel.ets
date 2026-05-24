@@ -1,12 +1,18 @@
 import { ChatPaginationState, ChatQuoteContextState, ChatRouteParams, MessageItem } from '../models/ChatModels';
 import { MessageService } from '../services/MessageService';
+import { WebSocketManager } from '../services/WebSocketManager';
+import { WebSocketDraftUpdate, WebSocketEvent, WebSocketEventType } from '../models/WebSocketModels';
 
 export class ChatViewModel {
   private readonly messageService = new MessageService();
+  private readonly webSocketManager = WebSocketManager.getInstance();
   private mainMessages: MessageItem[] = [];
   private quoteMessages: MessageItem[] = [];
   private mainPagination: ChatPaginationState = new ChatPaginationState();
   private quotePagination: ChatPaginationState = new ChatPaginationState();
+  private readonly onSocketEvent = (event: WebSocketEvent): void => {
+    this.handleSocketEvent(event);
+  };
 
   loading: boolean = false;
   errorMessage: string = '';
@@ -17,11 +23,16 @@ export class ChatViewModel {
   pagination: ChatPaginationState = new ChatPaginationState();
   quoteContext: ChatQuoteContextState = new ChatQuoteContextState();
   initialLatestMsgSeq: number = 0;
+  remoteDraft: string = '';
+  onMessagesUpdated: (() => void) | undefined = undefined;
+  onMessagesAppended: ((messages: MessageItem[]) => void) | undefined = undefined;
+  onRemoteDraftUpdated: (() => void) | undefined = undefined;
 
   bindRoute(params: ChatRouteParams): void {
     this.chatId = params.chatId;
     this.chatType = params.chatType;
     this.title = params.title;
+    this.webSocketManager.addEventListener(this.onSocketEvent);
   }
 
   async loadMessages(): Promise<void> {
@@ -54,6 +65,10 @@ export class ChatViewModel {
     } finally {
       this.loading = false;
     }
+  }
+
+  unbind(): void {
+    this.webSocketManager.removeEventListener(this.onSocketEvent);
   }
 
   async loadMoreMessages(): Promise<boolean> {
@@ -116,6 +131,16 @@ export class ChatViewModel {
       this.errorMessage = err.message || 'send message failed';
       this.loading = false;
       return false;
+    }
+  }
+
+  async syncDraftInput(input: string): Promise<void> {
+    if (this.chatId.length === 0) {
+      return;
+    }
+    try {
+      await this.webSocketManager.sendDraft(this.chatId, input);
+    } catch (_error) {
     }
   }
 
@@ -274,12 +299,18 @@ export class ChatViewModel {
   private applyMainMessages(): void {
     this.messages = this.copyMessages(this.mainMessages);
     this.pagination.copyFrom(this.mainPagination);
+    if (this.onMessagesUpdated !== undefined) {
+      this.onMessagesUpdated();
+    }
   }
 
   private applyQuoteMessages(): void {
     this.messages = this.copyMessages(this.quoteMessages);
     this.pagination.copyFrom(this.quotePagination);
     this.quoteContext.hasNewer = this.computeQuoteHasNewer();
+    if (this.onMessagesUpdated !== undefined) {
+      this.onMessagesUpdated();
+    }
   }
 
   private computeQuoteHasNewer(): boolean {
@@ -406,5 +437,139 @@ export class ChatViewModel {
     target.oldestMsgId = oldest.msgId;
     target.oldestMsgSeq = oldest.msgSeq;
     target.hasMore = oldest.msgId.length > 0;
+  }
+
+  private handleSocketEvent(event: WebSocketEvent): void {
+    if (event.type === WebSocketEventType.DRAFT) {
+      this.applyRemoteDraft(event.draft);
+      return;
+    }
+
+    if (event.message === undefined) {
+      return;
+    }
+    if (event.message.chatId !== this.chatId) {
+      return;
+    }
+
+    if (event.type === WebSocketEventType.MESSAGE) {
+      this.applyIncomingMessage(event.message);
+      return;
+    }
+    if (event.type === WebSocketEventType.MESSAGE_EDITED) {
+      this.applyEditedMessage(event.message);
+      return;
+    }
+    if (event.type === WebSocketEventType.STREAM) {
+      this.applyStreamMessage(event);
+    }
+  }
+
+  private applyRemoteDraft(draft: WebSocketDraftUpdate | undefined): void {
+    if (draft === undefined || draft.chatId !== this.chatId) {
+      return;
+    }
+    this.remoteDraft = draft.input;
+    if (this.onRemoteDraftUpdated !== undefined) {
+      this.onRemoteDraftUpdated();
+    }
+  }
+
+  private applyIncomingMessage(item: MessageItem): void {
+    const previousMessages: MessageItem[] = this.copyMessages(this.mainMessages);
+    this.mainMessages = this.normalizeForTimeline(this.mergeMessageLists(this.mainMessages, [item]));
+    this.initialLatestMsgSeq = this.mainMessages.length > 0 ? this.mainMessages[this.mainMessages.length - 1].msgSeq : this.initialLatestMsgSeq;
+    this.refreshPaginationState(this.mainMessages, this.mainPagination);
+    if (this.quoteContext.active) {
+      if (item.msgId === this.quoteContext.targetMsgId || item.quoteMsgId === this.quoteContext.targetMsgId) {
+        this.quoteMessages = this.normalizeForTimeline(this.mergeMessageLists(this.quoteMessages, [item]));
+        this.refreshPaginationState(this.quoteMessages, this.quotePagination);
+        this.applyQuoteMessages();
+        return;
+      }
+      return;
+    }
+    const appended: MessageItem[] = this.collectTailAppendedMessages(previousMessages, this.mainMessages);
+    if (appended.length > 0) {
+      this.messages = this.copyMessages(this.mainMessages);
+      this.pagination.copyFrom(this.mainPagination);
+      if (this.onMessagesAppended !== undefined) {
+        this.onMessagesAppended(appended);
+      }
+      return;
+    }
+    this.applyMainMessages();
+  }
+
+  private applyEditedMessage(item: MessageItem): void {
+    this.mainMessages = this.replaceMessage(this.mainMessages, item);
+    this.refreshPaginationState(this.mainMessages, this.mainPagination);
+    if (this.quoteContext.active) {
+      this.quoteMessages = this.replaceMessage(this.quoteMessages, item);
+      this.refreshPaginationState(this.quoteMessages, this.quotePagination);
+      this.applyQuoteMessages();
+      return;
+    }
+    this.applyMainMessages();
+  }
+
+  private applyStreamMessage(event: WebSocketEvent): void {
+    const stream = event.stream;
+    if (stream === undefined) {
+      return;
+    }
+    this.mainMessages = this.appendStreamContent(this.mainMessages, stream.msgId, stream.content);
+    if (this.quoteContext.active) {
+      this.quoteMessages = this.appendStreamContent(this.quoteMessages, stream.msgId, stream.content);
+      this.applyQuoteMessages();
+      return;
+    }
+    this.applyMainMessages();
+  }
+
+  private replaceMessage(list: MessageItem[], target: MessageItem): MessageItem[] {
+    const next: MessageItem[] = [];
+    let replaced: boolean = false;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].msgId === target.msgId) {
+        next.push(target);
+        replaced = true;
+      } else {
+        next.push(list[i]);
+      }
+    }
+    if (!replaced) {
+      next.push(target);
+    }
+    return this.normalizeForTimeline(next);
+  }
+
+  private appendStreamContent(list: MessageItem[], msgId: string, content: string): MessageItem[] {
+    const next: MessageItem[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const item: MessageItem = list[i];
+      if (item.msgId === msgId) {
+        item.contentText = `${item.contentText}${content}`;
+        item.rawText = item.contentText;
+      }
+      next.push(item);
+    }
+    return next;
+  }
+
+  private collectTailAppendedMessages(previousMessages: MessageItem[], nextMessages: MessageItem[]): MessageItem[] {
+    if (previousMessages.length > nextMessages.length) {
+      return [];
+    }
+    for (let i = 0; i < previousMessages.length; i++) {
+      if (previousMessages[i].msgId !== nextMessages[i].msgId) {
+        return [];
+      }
+    }
+    const appended: MessageItem[] = [];
+    for (let i = previousMessages.length; i < nextMessages.length; i++) {
+      appended.push(nextMessages[i]);
+    }
+    return appended;
   }
 }

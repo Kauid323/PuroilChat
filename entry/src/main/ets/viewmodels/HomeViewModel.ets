@@ -5,11 +5,25 @@ import { ConversationService } from '../services/ConversationService';
 import { AvatarImageService } from '../services/AvatarImageService';
 import { CryptoTokenStore } from '../services/CryptoTokenStore';
 import { SettingsStore } from '../services/SettingsStore';
+import { WebSocketManager } from '../services/WebSocketManager';
+import { WebSocketConnectionState, WebSocketConnectionStatus, WebSocketEvent, WebSocketEventType } from '../models/WebSocketModels';
 
 export class HomeViewModel {
   private readonly conversationService = new ConversationService();
   private readonly avatarService = new AvatarImageService();
+  private readonly webSocketManager = WebSocketManager.getInstance();
   private avatarLoadingUrls: string[] = [];
+  private readonly onConnectionStateChanged = (state: WebSocketConnectionState): void => {
+    this.socketState = state;
+    if (this.onSocketStateUpdated !== undefined) {
+      this.onSocketStateUpdated();
+    }
+  };
+  private readonly onSocketEvent = (event: WebSocketEvent): void => {
+    if (event.type === WebSocketEventType.MESSAGE || event.type === WebSocketEventType.MESSAGE_EDITED) {
+      void this.refreshConversationsSilently();
+    }
+  };
 
   currentTab: number = 0;
   loading: boolean = false;
@@ -18,6 +32,8 @@ export class HomeViewModel {
   avatarKeys: string[] = [];
   avatarImages: image.PixelMap[] = [];
   onAvatarUpdated: (() => void) | undefined = undefined;
+  onSocketStateUpdated: (() => void) | undefined = undefined;
+  socketState: WebSocketConnectionState = new WebSocketConnectionState();
 
   private findAvatarIndex(url: string): number {
     for (let i = 0; i < this.avatarKeys.length; i++) {
@@ -69,6 +85,7 @@ export class HomeViewModel {
     this.loading = true;
     this.errorMessage = '';
     try {
+      await this.ensureWebSocketStarted();
       this.avatarLoadingUrls = [];
       this.conversations = await this.conversationService.listConversations();
       this.loading = false;
@@ -78,6 +95,35 @@ export class HomeViewModel {
       this.errorMessage = err.message || 'load conversations failed';
       this.conversations = [];
       this.loading = false;
+    }
+  }
+
+  private async ensureWebSocketStarted(): Promise<void> {
+    this.webSocketManager.addConnectionListener(this.onConnectionStateChanged);
+    this.webSocketManager.addEventListener(this.onSocketEvent);
+    if (this.webSocketManager.isStarted()) {
+      this.socketState = this.webSocketManager.getConnectionState();
+      return;
+    }
+    try {
+      await this.webSocketManager.start();
+      this.socketState = this.webSocketManager.getConnectionState();
+    } catch (error) {
+      const err: Error = error as Error;
+      this.socketState.status = WebSocketConnectionStatus.ERROR;
+      this.socketState.message = err.message || 'websocket start failed';
+    }
+  }
+
+  private async refreshConversationsSilently(): Promise<void> {
+    try {
+      const loaded: ConversationItem[] = await this.conversationService.listConversations();
+      this.conversations = loaded;
+      void this.preloadAvatars();
+      if (this.onSocketStateUpdated !== undefined) {
+        this.onSocketStateUpdated();
+      }
+    } catch (_error) {
     }
   }
 
@@ -110,6 +156,9 @@ export class HomeViewModel {
   }
 
   logout(): void {
+    this.webSocketManager.removeConnectionListener(this.onConnectionStateChanged);
+    this.webSocketManager.removeEventListener(this.onSocketEvent);
+    void this.webSocketManager.stop();
     CryptoTokenStore.clearToken();
   }
 

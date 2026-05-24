@@ -31,6 +31,8 @@ struct Chat {
   @State initialMessageIndex: number = 0;
   @State draftMessage: string = '';
   @State sending: boolean = false;
+  @State remoteDraftText: string = '';
+  @State enteringMessageKeys: string[] = [];
   private firstSyncDone: boolean = false;
   private highlightToken: number = 0;
 
@@ -55,9 +57,30 @@ struct Chat {
   aboutToAppear(): void {
     const params: ChatRouteParams = this.getUIContext().getRouter().getParams() as ChatRouteParams;
     this.vm.bindRoute(params);
+    this.vm.onMessagesUpdated = () => {
+      this.syncFromVm();
+      this.initialMessageIndex = this.messages.length > 0 ? this.messages.length - 1 : 0;
+      this.applyMessages(this.initialMessageIndex, ScrollAlign.END);
+    };
+    this.vm.onMessagesAppended = (items: MessageItem[]) => {
+      this.syncFromVm();
+      this.messageDataSource.appendMessages(items);
+      this.animateAppendedMessages(items);
+      this.initialMessageIndex = this.messages.length > 0 ? this.messages.length - 1 : 0;
+      setTimeout(() => {
+        this.scrollToMessageIndex(this.messages.length - 1, ScrollAlign.END);
+      }, 16);
+    };
+    this.vm.onRemoteDraftUpdated = () => {
+      this.remoteDraftText = this.vm.remoteDraft;
+    };
     this.layoutStyle = ChatMessageLayoutFactory.create(params.layoutStyleName);
     this.firstSyncDone = false;
     void this.refreshMessages();
+  }
+
+  aboutToDisappear(): void {
+    this.vm.unbind();
   }
 
   private syncFromVm(): void {
@@ -138,6 +161,7 @@ struct Chat {
 
   private applyMessages(targetIndex: number, align: ScrollAlign, highlightMsgId: string = ''): void {
     this.firstSyncDone = false;
+    this.enteringMessageKeys = [];
     this.messageDataSource.replaceAll(this.messages);
     setTimeout(() => {
       this.firstSyncDone = true;
@@ -201,6 +225,69 @@ struct Chat {
     }
     this.highlightVisible = false;
     this.highlightedMsgId = '';
+  }
+
+  private isEnteringMessage(item: MessageItem): boolean {
+    const key: string = this.buildMessageKey(item);
+    for (let i = 0; i < this.enteringMessageKeys.length; i++) {
+      if (this.enteringMessageKeys[i] === key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private animateAppendedMessages(items: MessageItem[]): void {
+    if (items.length === 0) {
+      return;
+    }
+    const keys: string[] = [];
+    for (let i = 0; i < items.length; i++) {
+      keys.push(this.buildMessageKey(items[i]));
+    }
+    this.enteringMessageKeys = keys;
+    setTimeout(() => {
+      const activeKeys: string[] = [];
+      for (let i = 0; i < this.enteringMessageKeys.length; i++) {
+        let keep: boolean = true;
+        for (let j = 0; j < keys.length; j++) {
+          if (this.enteringMessageKeys[i] === keys[j]) {
+            keep = false;
+            break;
+          }
+        }
+        if (keep) {
+          activeKeys.push(this.enteringMessageKeys[i]);
+        }
+      }
+      this.enteringMessageKeys = activeKeys;
+    }, 260);
+  }
+
+  private applyIncrementalTailMessages(previousMessages: MessageItem[]): boolean {
+    if (previousMessages.length > this.messages.length) {
+      return false;
+    }
+    for (let i = 0; i < previousMessages.length; i++) {
+      if (this.buildMessageKey(previousMessages[i]) !== this.buildMessageKey(this.messages[i])) {
+        return false;
+      }
+    }
+    const appendCount: number = this.messages.length - previousMessages.length;
+    if (appendCount <= 0) {
+      return false;
+    }
+    const appended: MessageItem[] = [];
+    for (let i = this.messages.length - appendCount; i < this.messages.length; i++) {
+      appended.push(this.messages[i]);
+    }
+    this.messageDataSource.appendMessages(appended);
+    this.animateAppendedMessages(appended);
+    this.initialMessageIndex = this.messages.length - 1;
+    setTimeout(() => {
+      this.scrollToMessageIndex(this.messages.length - 1, ScrollAlign.END);
+    }, 16);
+    return true;
   }
 
   private buildMessageKey(item: MessageItem): string {
@@ -395,14 +482,17 @@ struct Chat {
     }
     this.sending = true;
     try {
+      const previousMessages: MessageItem[] = [...this.messages];
       const sent: boolean = await this.vm.sendTextMessage(messageText);
       this.syncFromVm();
       if (!sent) {
         return;
       }
       this.draftMessage = '';
-      this.initialMessageIndex = this.messages.length > 0 ? this.messages.length - 1 : 0;
-      this.applyMessages(this.initialMessageIndex, ScrollAlign.END);
+      if (!this.applyIncrementalTailMessages(previousMessages)) {
+        this.initialMessageIndex = this.messages.length > 0 ? this.messages.length - 1 : 0;
+        this.applyMessages(this.initialMessageIndex, ScrollAlign.END);
+      }
     } finally {
       this.sending = false;
     }
@@ -639,6 +729,9 @@ struct Chat {
     }
     .width('100%')
     .padding({ top: this.topSpacing(item), bottom: this.bottomSpacing(item) })
+    .opacity(this.isEnteringMessage(item) ? 0.25 : 1)
+    .translate({ x: this.isEnteringMessage(item) ? (item.isSelf ? 18 : -18) : 0, y: this.isEnteringMessage(item) ? 10 : 0 })
+    .animation({ duration: 220, curve: Curve.Friction })
     .alignItems(HorizontalAlign.Start)
   }
 
@@ -763,6 +856,7 @@ struct Chat {
           .padding({ left: 14, right: 14 })
           .onChange((value: string) => {
             this.draftMessage = value;
+            void this.vm.syncDraftInput(value);
           })
 
         Button('Send')
@@ -782,6 +876,14 @@ struct Chat {
       .height(52)
       .padding({ left: 12, right: 12, top: 7, bottom: 7 })
       .backgroundColor('#F8FAFD')
+
+      if (this.remoteDraftText.length > 0) {
+        Text(`对方正在输入：${this.remoteDraftText}`)
+          .width('100%')
+          .padding({ left: 16, right: 16, bottom: 8 })
+          .fontSize(12)
+          .fontColor('#667085')
+      }
     }
     .width('100%')
     .height('100%')
